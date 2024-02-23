@@ -7,10 +7,8 @@ import pandas as pd
 from PIL import Image
 import os
 import torch.nn as nn
-from sklearn.metrics import roc_auc_score, accuracy_score
-
-
-# Make distributed processes
+from sklearn.metrics import roc_auc_score, accuracy_score, precision_recall_curve, auc
+import numpy as np
 
 
 # define custom dataset
@@ -31,9 +29,6 @@ class MimicDataset(Dataset):
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
         image_path = str(row['file_path'])
-        # print(self.path)
-        # print(image_path)
-        # print(os.path.join(self.path, image_path))
         image = Image.open(self.path + image_path).convert('RGB')
         target = []
         for disease in self.diseases:
@@ -55,18 +50,18 @@ class MimicDataset(Dataset):
 
 def train(model, train_loader, criterion, optimizer, device):
     total_loss = []
-    global iteration
 
     model.train()
     for batch_idx, (inputs, targets) in enumerate(train_loader):
         optimizer.zero_grad()
+
         outputs = model(inputs.to(device))
+        outputs = outputs.view(-1, 14, 4)
 
         targets = targets.to(torch.float32).to(device)
         loss = criterion(outputs, targets)
 
         total_loss.append(loss.item())
-        iteration += 1
 
         loss.backward()
         optimizer.step()
@@ -76,30 +71,49 @@ def train(model, train_loader, criterion, optimizer, device):
 
 
 def test(model, data_loader, criterion, device):
-
     model.eval()
     
     total_loss = []
+    truths = np.empty((0,4))
+    predictions = np.empty((0,4))
 
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(data_loader):
             outputs = model(inputs.to(device))
+            outputs = outputs.view(-1, 14, 4) 
+            # the model wants 56 targets
+            # the loss function wants (14,4)
+            # scikit-learn wants them back to 56
             
             targets = targets.to(torch.float32).to(device)
             loss = criterion(outputs, targets)
             total_loss.append(loss.item())
 
-            batch_size,_,_ = outputs.size()
+            m = nn.Softmax(dim=-1)
+            outputs = m(outputs)
+            
+            outputs = outputs.view(outputs.size(0)*outputs.size(1), -1).cpu().numpy()
+            targets = targets.view(targets.size(0)*targets.size(1), -1).cpu().numpy()
 
-            outputs = torch.reshape(outputs, (batch_size*14,4))
-            targets = torch.reshape(targets, (batch_size*14,4))
-
-            m = nn.Softmax(dim=1)
-            outputs = m(outputs).to(device)
+            truths = np.concatenate((truths, targets),0)
+            predictions = np.concatenate((predictions, outputs),0)
         
         test_loss = sum(total_loss) / len(total_loss)
 
-        auc = roc_auc_score(targets, outputs)
-        acc = accuracy_score(targets, outputs)
+        return [test_loss, computeAUC(truths,predictions), computeAccuracy(truths, predictions)]
+    
 
-        return [test_loss, auc, acc]
+def computeAUC(targets, outputs):
+    pr_auc_scores = []
+    for label_index in range(targets.shape[1]):
+        true_labels = targets[:, label_index]
+        predicted_scores = outputs[:, label_index]
+        precision, recall, _ = precision_recall_curve(true_labels, predicted_scores)
+        auc_score = auc(recall, precision)
+        pr_auc_scores.append(auc_score)
+    return np.mean(pr_auc_scores)
+
+def computeAccuracy(targets, outputs):
+    predicted_classes = np.argmax(outputs, axis=-1)
+    predicted_binarized = (np.arange(4) == predicted_classes[..., None]).astype(int)
+    return accuracy_score(targets.flatten(), predicted_binarized.flatten())
